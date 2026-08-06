@@ -45,6 +45,7 @@ struct ScheduleData {
   int16_t repeatType;       // 0=once, 1=hourly, 2=daily, 3=weekly
   int16_t repeatInterval;
   bool enabled;
+  bool usePump;             // NEW: Store pump preference per zone
 };
 
 struct BackupBlock {
@@ -56,8 +57,15 @@ struct BackupBlock {
 };
 
 struct CloudZone {
-  int *hour, *minute, *durationMin, *repeatType, *repeatInterval;
-  bool *enabled, *manualCtrl, *led;
+  int *hour;
+  int *minute;
+  int *durationMin;
+  int *repeatType;
+  int *repeatInterval;
+  bool *enabled;
+  bool *manualCtrl;
+  bool *led;
+  bool *usePump;            // NEW: Pointer to pump enable flag
 };
 
 BackupBlock backup;
@@ -77,9 +85,39 @@ inline ScheduleData &SD(uint8_t z) { return backup.schedules[z]; }
 
 void initCloudZones() {
   CloudZone zones[NUM_ZONES] = {
-    {&start_A_hour_sched, &start_A_minute_sched, &scheduler_A_durationMinutes, &scheduler_A_repeatType, &scheduler_A_repeatInterval, &scheduler_A_enabled, &solenoid_A_manual_control, &state_led_A},
-    {&start_B_hour_sched, &start_B_minute_sched, &scheduler_B_durationMinutes, &scheduler_B_repeatType, &scheduler_B_repeatInterval, &scheduler_B_enabled, &solenoid_B_manual_control, &state_led_B},
-    {&start_H_hour_sched, &start_H_minute_sched, &scheduler_H_durationMinutes, &scheduler_H_repeatType, &scheduler_H_repeatInterval, &scheduler_H_enabled, &solenoid_H_manual_control, &state_led_H}
+    {
+      &start_A_hour_sched,
+      &start_A_minute_sched,
+      &scheduler_A_durationMinutes,
+      &scheduler_A_repeatType,
+      &scheduler_A_repeatInterval,
+      &scheduler_A_enabled,
+      &solenoid_A_manual_control,
+      &state_led_A,
+      &scheduler_A_usePump          // NEW
+    },
+    {
+      &start_B_hour_sched,
+      &start_B_minute_sched,
+      &scheduler_B_durationMinutes,
+      &scheduler_B_repeatType,
+      &scheduler_B_repeatInterval,
+      &scheduler_B_enabled,
+      &solenoid_B_manual_control,
+      &state_led_B,
+      &scheduler_B_usePump          // NEW
+    },
+    {
+      &start_H_hour_sched,
+      &start_H_minute_sched,
+      &scheduler_H_durationMinutes,
+      &scheduler_H_repeatType,
+      &scheduler_H_repeatInterval,
+      &scheduler_H_enabled,
+      &solenoid_H_manual_control,
+      &state_led_H,
+      &scheduler_H_usePump          // NEW
+    }
   };
   memcpy(cz, zones, sizeof(zones));
 }
@@ -202,7 +240,16 @@ void initDefaults(bool publish) {
   DateTime now = rtcOK ? rtc.now() : DateTime(2026, 1, 1, 6, 0, 0);
   memset(&backup, 0, sizeof(backup));
   backup.magic = EEPROM_MAGIC; backup.version = EEPROM_VERSION; backup.timestamp = now.unixtime();
-  for (uint8_t z = 0; z < NUM_ZONES; z++) SD(z) = {(int32_t)DateTime(now.year(), now.month(), now.day(), 6, 0, 0).unixtime(), 600, 2, 1, false};
+  for (uint8_t z = 0; z < NUM_ZONES; z++) {
+    SD(z) = {
+      (int32_t)DateTime(now.year(), now.month(), now.day(), 6, 0, 0).unixtime(), 
+      600, 
+      2, 
+      1, 
+      false,
+      true   // NEW: default usePump = true
+    };
+  }
   backup.checksum = checksum((uint8_t *)&backup.schedules, sizeof(backup.schedules));
   if (eepromOK) writeEEPROM(0, (uint8_t *)&backup, sizeof(backup));
   if (publish) pushToCloud();
@@ -223,7 +270,11 @@ uint8_t findBestSlot() {
 
 void loadFromEEPROM() {
   BackupBlock candidate;
-  if (eepromOK && readEEPROM(activeSlot * EEPROM_SLOT_SZ, (uint8_t *)&candidate, sizeof(candidate)) && candidate.magic == EEPROM_MAGIC && candidate.version == EEPROM_VERSION && checksum((uint8_t *)&candidate.schedules, sizeof(candidate.schedules)) == candidate.checksum) backup = candidate;
+  if (eepromOK && readEEPROM(activeSlot * EEPROM_SLOT_SZ, (uint8_t *)&candidate, sizeof(candidate)) && 
+      candidate.magic == EEPROM_MAGIC && candidate.version == EEPROM_VERSION && 
+      checksum((uint8_t *)&candidate.schedules, sizeof(candidate.schedules)) == candidate.checksum) {
+    backup = candidate;
+  }
   pushToCloud();
 }
 
@@ -233,7 +284,10 @@ void saveToEEPROM() {
   backup.timestamp = rtcOK ? rtc.now().unixtime() : millis() / 1000;
   backup.checksum = checksum((uint8_t *)&backup.schedules, sizeof(backup.schedules));
   uint8_t next = (activeSlot + 1) % EEPROM_SLOTS;
-  if (writeEEPROM(next * EEPROM_SLOT_SZ, (uint8_t *)&backup, sizeof(backup))) { activeSlot = next; scheduleDirty = false; }
+  if (writeEEPROM(next * EEPROM_SLOT_SZ, (uint8_t *)&backup, sizeof(backup))) { 
+    activeSlot = next; 
+    scheduleDirty = false; 
+  }
 }
 
 uint8_t daysInMonth(int year, int month) {
@@ -244,12 +298,18 @@ uint8_t daysInMonth(int year, int month) {
 
 void pushToCloud() {
   DateTime first(SD(0).startEpochUTC);
-  scheduler_start_year = first.year(); scheduler_start_month = first.month();
+  scheduler_start_year = first.year(); 
+  scheduler_start_month = first.month();
+  
   for (uint8_t z = 0; z < NUM_ZONES; z++) {
     DateTime start(SD(z).startEpochUTC);
-    *cz[z].hour = start.hour(); *cz[z].minute = start.minute();
-    *cz[z].durationMin = SD(z).durationSec / 60; *cz[z].repeatType = SD(z).repeatType;
-    *cz[z].repeatInterval = SD(z).repeatInterval; *cz[z].enabled = SD(z).enabled;
+    *cz[z].hour = start.hour(); 
+    *cz[z].minute = start.minute();
+    *cz[z].durationMin = SD(z).durationSec / 60; 
+    *cz[z].repeatType = SD(z).repeatType;
+    *cz[z].repeatInterval = SD(z).repeatInterval; 
+    *cz[z].enabled = SD(z).enabled;
+    *cz[z].usePump = SD(z).usePump;   // NEW
   }
 }
 
@@ -257,18 +317,33 @@ bool hasChanged(uint8_t z) {
   DateTime oldStart(SD(z).startEpochUTC);
   int day = min(oldStart.day(), daysInMonth(scheduler_start_year, scheduler_start_month));
   DateTime requested(scheduler_start_year, scheduler_start_month, day, *cz[z].hour, *cz[z].minute, 0);
-  return SD(z).startEpochUTC != (int32_t)requested.unixtime() || SD(z).durationSec != (uint32_t)(*cz[z].durationMin * 60) || SD(z).repeatType != *cz[z].repeatType || SD(z).repeatInterval != *cz[z].repeatInterval || SD(z).enabled != *cz[z].enabled;
+  return SD(z).startEpochUTC != (int32_t)requested.unixtime() || 
+         SD(z).durationSec != (uint32_t)(*cz[z].durationMin * 60) || 
+         SD(z).repeatType != *cz[z].repeatType || 
+         SD(z).repeatInterval != *cz[z].repeatInterval || 
+         SD(z).enabled != *cz[z].enabled ||
+         SD(z).usePump != *cz[z].usePump;  // NEW
 }
 
 void onScheduleChange(uint8_t z) {
-  if (*cz[z].durationMin < 0 || *cz[z].repeatInterval <= 0 || scheduler_start_month < 1 || scheduler_start_month > 12) return;
+  if (*cz[z].durationMin < 0 || *cz[z].repeatInterval <= 0 || 
+      scheduler_start_month < 1 || scheduler_start_month > 12) return;
+  
   if (!hasChanged(z)) return;
+  
   DateTime oldStart(SD(z).startEpochUTC);
   int day = min(oldStart.day(), daysInMonth(scheduler_start_year, scheduler_start_month));
-  SD(z).startEpochUTC = DateTime(scheduler_start_year, scheduler_start_month, day, *cz[z].hour, *cz[z].minute, 0).unixtime();
-  SD(z).durationSec = (uint32_t)*cz[z].durationMin * 60; SD(z).repeatType = *cz[z].repeatType;
-  SD(z).repeatInterval = *cz[z].repeatInterval; SD(z).enabled = *cz[z].enabled;
-  scheduleDirty = true; lastChangeMs = millis();
+  
+  SD(z).startEpochUTC = DateTime(scheduler_start_year, scheduler_start_month, 
+                                 day, *cz[z].hour, *cz[z].minute, 0).unixtime();
+  SD(z).durationSec = (uint32_t)*cz[z].durationMin * 60;
+  SD(z).repeatType = *cz[z].repeatType;
+  SD(z).repeatInterval = *cz[z].repeatInterval;
+  SD(z).enabled = *cz[z].enabled;
+  SD(z).usePump = *cz[z].usePump;   // NEW: Save pump setting
+  
+  scheduleDirty = true; 
+  lastChangeMs = millis();
 }
 
 void onManualChange(uint8_t z, bool value) {
@@ -291,49 +366,70 @@ bool isActive(uint8_t z) {
   uint32_t now = rtcOK ? rtc.now().unixtime() : (timeBaseValid ? timeBaseUTC + millis() / 1000 : millis() / 1000);
   if (now < (uint32_t)s.startEpochUTC) return false;
   if (s.repeatType == 0) return now < (uint32_t)s.startEpochUTC + s.durationSec;
-  int64_t interval = s.repeatType == 1 ? 3600LL * s.repeatInterval : s.repeatType == 2 ? 86400LL * s.repeatInterval : s.repeatType == 3 ? 604800LL * s.repeatInterval : 0;
+  int64_t interval = s.repeatType == 1 ? 3600LL * s.repeatInterval : 
+                     s.repeatType == 2 ? 86400LL * s.repeatInterval : 
+                     s.repeatType == 3 ? 604800LL * s.repeatInterval : 0;
   return interval > 0 && ((int64_t)now - s.startEpochUTC) % interval < s.durationSec;
 }
 
 //==============================================================================
-// FIXED: controlZones() with RATE-LIMITED debugging
+// controlZones() with PUMP PER ZONE support
 //==============================================================================
 void controlZones() {
   static bool pumpOn = false; 
   bool anyOn = false;
+  bool pumpRequested = false;    // Track if any zone needs the pump
   
   // First pass: update all zones
   for (uint8_t z = 0; z < NUM_ZONES; z++) {
     // Automatic timeout after 3 minutes
-if (manualShadow[z])
-{
-    if (millis() - manualStartMs[z] >= MANUAL_TIMEOUT)
-    {
+    if (manualShadow[z]) {
+      if (millis() - manualStartMs[z] >= MANUAL_TIMEOUT) {
         Serial.print("Manual timeout Zone ");
         Serial.println(z);
-
         manualShadow[z] = false;
         *cz[z].manualCtrl = false;
+      }
     }
-}
-    bool shouldOn = (isActive(z) || manualShadow[z]);
     
-    if (shouldOn != zoneOn[z]) { 
-      digitalWrite(SOLENOID_PINS[z], shouldOn); 
-      zoneOn[z] = shouldOn; 
+    // Compute state once
+    bool automatic = isActive(z);
+    bool manual    = manualShadow[z];
+    bool shouldOn  = automatic || manual;
+    
+    // Control solenoid
+    if (shouldOn != zoneOn[z]) {
+      digitalWrite(SOLENOID_PINS[z], shouldOn);
+      zoneOn[z] = shouldOn;
     }
-    *cz[z].led = zoneOn[z]; 
-    anyOn |= zoneOn[z];
+    *cz[z].led = zoneOn[z];
+    
+    // Track which zones are on and if they need the pump
+    if (zoneOn[z]) {
+      anyOn = true;
+      
+      // Manual mode always requests the pump
+      pumpRequested |= manual;
+      
+      // Automatic mode follows the zone configuration
+      pumpRequested |= (automatic && *cz[z].usePump);
+    }
   }
   
-  // Calculate pump state
+  // Check safety interlock (tank empty)
   bool stopPump = ultrasonicStopPump();
-  bool requiredPump = anyOn && !stopPump;
+  
+  // Pump runs ONLY if:
+  // 1. At least one zone is ON
+  // 2. At least one active zone requires the pump (manual always does)
+  // 3. Tank has water (not in pumpStop condition)
+  bool requiredPump = pumpRequested && !stopPump;
   
   // Control pump
   if (requiredPump != pumpOn) {
     Serial.println("=== PUMP STATE CHANGE ===");
     Serial.print("anyOn="); Serial.println(anyOn);
+    Serial.print("pumpRequested="); Serial.println(pumpRequested);
     Serial.print("stopPump="); Serial.println(stopPump);
     Serial.print("requiredPump="); Serial.println(requiredPump);
     digitalWrite(PUMP_PIN, requiredPump);
@@ -359,15 +455,17 @@ if (manualShadow[z])
         Serial.print(manualShadow[z]);
         Serial.print(", active=");
         Serial.print(isActive(z));
+        Serial.print(", usePump=");
+        Serial.print(*cz[z].usePump);
         Serial.print(")");
-        
-        // Show solenoid pin state
         Serial.print(" pin=");
         Serial.print(digitalRead(SOLENOID_PINS[z]));
         Serial.println();
       }
       Serial.print("Pump: ");
       Serial.print(pumpOn ? "ON" : "OFF");
+      Serial.print(" | pumpRequested=");
+      Serial.print(pumpRequested);
       Serial.print(" | stopPump=");
       Serial.print(stopPump);
       Serial.print(" | anyOn=");
@@ -382,10 +480,63 @@ void updateTime() {
   uint32_t now = rtcOK ? rtc.now().unixtime() : 0;
   if (WiFi.status() == WL_CONNECTED) {
     uint32_t cloudTime = ArduinoCloud.getLocalTime();
-    if (cloudTime > 1600000000UL) { now = cloudTime; timePicker = cloudTime; if (rtcOK && abs((long)(cloudTime - rtc.now().unixtime())) > 5) rtc.adjust(DateTime(cloudTime)); }
+    if (cloudTime > 1600000000UL) { 
+      now = cloudTime; 
+      timePicker = cloudTime; 
+      if (rtcOK && abs((long)(cloudTime - rtc.now().unixtime())) > 5) 
+        rtc.adjust(DateTime(cloudTime)); 
+    }
   }
-  if (now) { timePicker = now; timeBaseUTC = now - millis() / 1000; timeBaseValid = true; }
+  if (now) { 
+    timePicker = now; 
+    timeBaseUTC = now - millis() / 1000; 
+    timeBaseValid = true; 
+  }
 }
+
+// Cloud change callbacks
+void onSchedulerStartYearChange() { for (uint8_t z = 0; z < NUM_ZONES; z++) onScheduleChange(z); }
+void onSchedulerStartMonthChange() { for (uint8_t z = 0; z < NUM_ZONES; z++) onScheduleChange(z); }
+
+void onStartAHourSchedChange() { onScheduleChange(0); }
+void onStartAMinuteSchedChange() { onScheduleChange(0); }
+void onSchedulerADurationMinutesChange() { onScheduleChange(0); }
+void onSchedulerARepeatIntervalChange() { onScheduleChange(0); }
+void onSchedulerARepeatTypeChange() { onScheduleChange(0); }
+void onSchedulerAEnabledChange() { onScheduleChange(0); }
+void onSchedulerAUsePumpChange() { 
+  Serial.print("Zone A pump setting changed to: ");
+  Serial.println(scheduler_A_usePump);
+  onScheduleChange(0); 
+}
+
+void onStartBHourSchedChange() { onScheduleChange(1); }
+void onStartBMinuteSchedChange() { onScheduleChange(1); }
+void onSchedulerBDurationMinutesChange() { onScheduleChange(1); }
+void onSchedulerBRepeatIntervalChange() { onScheduleChange(1); }
+void onSchedulerBRepeatTypeChange() { onScheduleChange(1); }
+void onSchedulerBEnabledChange() { onScheduleChange(1); }
+void onSchedulerBUsePumpChange() { 
+  Serial.print("Zone B pump setting changed to: ");
+  Serial.println(scheduler_B_usePump);
+  onScheduleChange(1); 
+}
+
+void onStartHHourSchedChange() { onScheduleChange(2); }
+void onStartHMinuteSchedChange() { onScheduleChange(2); }
+void onSchedulerHDurationMinutesChange() { onScheduleChange(2); }
+void onSchedulerHRepeatIntervalChange() { onScheduleChange(2); }
+void onSchedulerHRepeatTypeChange() { onScheduleChange(2); }
+void onSchedulerHEnabledChange() { onScheduleChange(2); }
+void onSchedulerHUsePumpChange() { 
+  Serial.print("Zone H pump setting changed to: ");
+  Serial.println(scheduler_H_usePump);
+  onScheduleChange(2); 
+}
+
+void onSolenoidAManualControlChange() { onManualChange(0, solenoid_A_manual_control); }
+void onSolenoidBManualControlChange() { onManualChange(1, solenoid_B_manual_control); }
+void onSolenoidHManualControlChange() { onManualChange(2, solenoid_H_manual_control); }
 
 void setup() {
   Serial.begin(115200);
@@ -448,32 +599,3 @@ void loop() {
   saveToEEPROM(); 
   delay(10);
 }
-
-// Cloud change callbacks
-void onSchedulerStartYearChange() { for (uint8_t z = 0; z < NUM_ZONES; z++) onScheduleChange(z); }
-void onSchedulerStartMonthChange() { for (uint8_t z = 0; z < NUM_ZONES; z++) onScheduleChange(z); }
-
-void onStartAHourSchedChange() { onScheduleChange(0); }
-void onStartAMinuteSchedChange() { onScheduleChange(0); }
-void onSchedulerADurationMinutesChange() { onScheduleChange(0); }
-void onSchedulerARepeatIntervalChange() { onScheduleChange(0); }
-void onSchedulerARepeatTypeChange() { onScheduleChange(0); }
-void onSchedulerAEnabledChange() { onScheduleChange(0); }
-
-void onStartBHourSchedChange() { onScheduleChange(1); }
-void onStartBMinuteSchedChange() { onScheduleChange(1); }
-void onSchedulerBDurationMinutesChange() { onScheduleChange(1); }
-void onSchedulerBRepeatIntervalChange() { onScheduleChange(1); }
-void onSchedulerBRepeatTypeChange() { onScheduleChange(1); }
-void onSchedulerBEnabledChange() { onScheduleChange(1); }
-
-void onStartHHourSchedChange() { onScheduleChange(2); }
-void onStartHMinuteSchedChange() { onScheduleChange(2); }
-void onSchedulerHDurationMinutesChange() { onScheduleChange(2); }
-void onSchedulerHRepeatIntervalChange() { onScheduleChange(2); }
-void onSchedulerHRepeatTypeChange() { onScheduleChange(2); }
-void onSchedulerHEnabledChange() { onScheduleChange(2); }
-
-void onSolenoidAManualControlChange() { onManualChange(0, solenoid_A_manual_control); }
-void onSolenoidBManualControlChange() { onManualChange(1, solenoid_B_manual_control); }
-void onSolenoidHManualControlChange() { onManualChange(2, solenoid_H_manual_control); }
