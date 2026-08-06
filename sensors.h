@@ -14,11 +14,18 @@ void initDHT22();
 void readDHT22();
 
 //======================================================
-// RCWL-1670 Ultrasonic
+// RCWL-1670 Ultrasonic (Existing - Keep as is)
 //======================================================
 
 void initUltrasonicSensor();
 void readUltrasonicDistanceCm();
+
+//======================================================
+// VL53L1X ToF (New - Added separately)
+//======================================================
+
+void initTOFSensor();
+void readTOFDistance();
 
 //======================================================
 // Soil Moisture
@@ -40,6 +47,14 @@ void readWaterTemperature();
 
 void initTDSSensor();
 void readTDSSensor();
+
+//======================================================
+// Ultrasonic Distance Getters (NEW)
+//======================================================
+
+float getUltrasonicDistance();
+bool ultrasonicWarning();
+bool ultrasonicStopPump();
 
 //======================================================
 // Serial Monitor
