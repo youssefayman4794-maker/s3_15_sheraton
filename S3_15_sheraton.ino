@@ -1,7 +1,5 @@
-#include "arduino_secrets.h"
 // 3-VALVE IRRIGATION CONTROLLER
-// ESP32-S3 + DS3231 RTC + 24C32 EEPROM + DHT22 + water-level interlock
-// Cloud variables must match the generated thingProperties.h supplied with this sketch.
+// ESP32-S3 + DS3231 RTC + 24C32 EEPROM + DHT22 + RCWL-1670 + VL53L1X ToF
 
 #include "thingProperties.h"
 #include <Wire.h>
@@ -15,9 +13,9 @@
 #define I2C_SDA 9
 #define I2C_SCL 8
 
-const uint8_t SOLENOID_PINS[NUM_ZONES] = {11, 4, 7}; // A, B, H -- change H pin if wired differently
+const uint8_t SOLENOID_PINS[NUM_ZONES] = {11, 4, 7}; // A, B, H
 
-#define MANUAL_TIMEOUT 180000UL
+#define MANUAL_TIMEOUT 60000UL
 #define MANUAL_RECONNECT_GRACE 5000UL
 #define TIME_SYNC_INTERVAL 1000UL
 #define BATTERY_READ_INTERVAL 300000UL
@@ -26,13 +24,18 @@ const uint8_t SOLENOID_PINS[NUM_ZONES] = {11, 4, 7}; // A, B, H -- change H pin 
 #define SOIL_READ_INTERVAL 2000UL
 #define EEPROM_WRITE_DELAY 5000UL
 #define VOLTAGE_DIVIDER_RATIO 4.3f
+#define DEBUG_INTERVAL 500UL  // Print debug every 500ms
 
-#define RTC_ADDRESS 0x68
-#define EEPROM_ADDRESS 0x57
-#define EEPROM_MAGIC 0xA5C4
-#define EEPROM_VERSION 1
-#define EEPROM_SLOTS 4
-#define EEPROM_SLOT_SZ 512
+// I2C Device Addresses
+#define RTC_ADDRESS         0x68
+#define EEPROM_ADDRESS      0x57
+#define VL53L1X_ADDRESS     0x29
+
+// ===== EEPROM Backup Configuration =====
+#define EEPROM_MAGIC        0xA5C4
+#define EEPROM_VERSION      1
+#define EEPROM_SLOTS        4
+#define EEPROM_SLOT_SZ      512
 
 RTC_DS3231 rtc;
 
@@ -66,6 +69,10 @@ uint32_t lastChangeMs = 0, timeBaseUTC = 0, lastCloudConnectTime = 0;
 uint8_t activeSlot = 0;
 bool timeBaseValid = false, cloudWasConnected = false;
 
+// Debug variables
+uint32_t lastDebugPrint = 0;
+bool lastPumpState = false;
+
 inline ScheduleData &SD(uint8_t z) { return backup.schedules[z]; }
 
 void initCloudZones() {
@@ -77,6 +84,45 @@ void initCloudZones() {
   memcpy(cz, zones, sizeof(zones));
 }
 
+// I2C Scanner Function
+void scanI2C() {
+  Serial.println("Scanning I2C bus...");
+  uint8_t foundDevices = 0;
+  
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      Serial.print("  Found device at 0x");
+      if (addr < 16) Serial.print("0");
+      Serial.print(addr, HEX);
+      
+      // Identify known devices
+      if (addr == RTC_ADDRESS) {
+        Serial.println(" (DS3231 RTC)");
+      } else if (addr == EEPROM_ADDRESS) {
+        Serial.println(" (24C32 EEPROM)");
+      } else if (addr == VL53L1X_ADDRESS) {
+        Serial.println(" (VL53L1X ToF)");
+      } else {
+        Serial.println(" (Unknown)");
+      }
+      foundDevices++;
+    }
+  }
+  
+  if (foundDevices == 0) {
+    Serial.println("  No I2C devices found!");
+  } else {
+    Serial.print("  Total devices found: ");
+    Serial.println(foundDevices);
+  }
+  
+  // Verify critical devices
+  if (foundDevices > 0) {
+    Serial.println("I2C bus check complete");
+  }
+}
+
 void initHardware() {
   for (uint8_t z = 0; z < NUM_ZONES; z++) {
     pinMode(SOLENOID_PINS[z], OUTPUT);
@@ -84,9 +130,33 @@ void initHardware() {
   }
   pinMode(PUMP_PIN, OUTPUT); digitalWrite(PUMP_PIN, LOW);
   pinMode(BATTERY_PIN, INPUT); analogSetAttenuation(ADC_11db);
-  Wire.begin(I2C_SDA, I2C_SCL); Wire.setClock(100000);
+  
+  // Initialize I2C bus
+  Wire.begin(I2C_SDA, I2C_SCL);
+  
+  // Try 100kHz first for stability with multiple devices
+  Wire.setClock(100000);  // Changed from 400kHz to 100kHz for reliability
+  
+  // Scan I2C bus to verify all devices
+  scanI2C();
+  
+  // Initialize RTC
   rtcOK = (Wire.beginTransmission(RTC_ADDRESS), Wire.endTransmission() == 0 && rtc.begin());
+  if (rtcOK) {
+    Serial.println("RTC initialized");
+  } else {
+    Serial.println("RTC not found!");
+  }
+  
+  // Check EEPROM
   eepromOK = (Wire.beginTransmission(EEPROM_ADDRESS), Wire.endTransmission() == 0);
+  if (eepromOK) {
+    Serial.println("EEPROM initialized");
+  } else {
+    Serial.println("EEPROM not found!");
+  }
+  
+  // Initialize all sensors
   initSensors();
 }
 
@@ -202,8 +272,18 @@ void onScheduleChange(uint8_t z) {
 }
 
 void onManualChange(uint8_t z, bool value) {
-  if (value) { manualShadow[z] = true; manualStartMs[z] = millis(); }
-  else if (millis() - lastCloudConnectTime > MANUAL_RECONNECT_GRACE) manualShadow[z] = false;
+  Serial.print("Manual change zone ");
+  Serial.print(z);
+  Serial.print(" -> ");
+  Serial.println(value);
+  
+  if (value) { 
+    manualShadow[z] = true; 
+    manualStartMs[z] = millis(); 
+  }
+  else if (millis() - lastCloudConnectTime > MANUAL_RECONNECT_GRACE) {
+    manualShadow[z] = false; 
+  }
 }
 
 bool isActive(uint8_t z) {
@@ -215,15 +295,87 @@ bool isActive(uint8_t z) {
   return interval > 0 && ((int64_t)now - s.startEpochUTC) % interval < s.durationSec;
 }
 
+//==============================================================================
+// FIXED: controlZones() with RATE-LIMITED debugging
+//==============================================================================
 void controlZones() {
-  static bool pumpOn = false; bool anyOn = false;
+  static bool pumpOn = false; 
+  bool anyOn = false;
+  
+  // First pass: update all zones
   for (uint8_t z = 0; z < NUM_ZONES; z++) {
-    if (manualShadow[z] && millis() - manualStartMs[z] >= MANUAL_TIMEOUT) { manualShadow[z] = false; *cz[z].manualCtrl = false; }
-    bool shouldOn = (isActive(z) || manualShadow[z]); // Water level sensor removed - always safe
-    if (shouldOn != zoneOn[z]) { digitalWrite(SOLENOID_PINS[z], shouldOn); zoneOn[z] = shouldOn; }
-    *cz[z].led = zoneOn[z]; anyOn |= zoneOn[z];
+    // Automatic timeout after 3 minutes
+if (manualShadow[z])
+{
+    if (millis() - manualStartMs[z] >= MANUAL_TIMEOUT)
+    {
+        Serial.print("Manual timeout Zone ");
+        Serial.println(z);
+
+        manualShadow[z] = false;
+        *cz[z].manualCtrl = false;
+    }
+}
+    bool shouldOn = (isActive(z) || manualShadow[z]);
+    
+    if (shouldOn != zoneOn[z]) { 
+      digitalWrite(SOLENOID_PINS[z], shouldOn); 
+      zoneOn[z] = shouldOn; 
+    }
+    *cz[z].led = zoneOn[z]; 
+    anyOn |= zoneOn[z];
   }
-  if (anyOn != pumpOn) { digitalWrite(PUMP_PIN, anyOn); pumpOn = anyOn; }
+  
+  // Calculate pump state
+  bool stopPump = ultrasonicStopPump();
+  bool requiredPump = anyOn && !stopPump;
+  
+  // Control pump
+  if (requiredPump != pumpOn) {
+    Serial.println("=== PUMP STATE CHANGE ===");
+    Serial.print("anyOn="); Serial.println(anyOn);
+    Serial.print("stopPump="); Serial.println(stopPump);
+    Serial.print("requiredPump="); Serial.println(requiredPump);
+    digitalWrite(PUMP_PIN, requiredPump);
+    pumpOn = requiredPump;
+    Serial.print("Pump now: ");
+    Serial.println(pumpOn ? "ON" : "OFF");
+    Serial.println("========================");
+  }
+  
+  // Rate-limited debug print (every 500ms)
+  if (millis() - lastDebugPrint >= DEBUG_INTERVAL) {
+    lastDebugPrint = millis();
+    
+    // Only print if something is ON or if pump state changed
+    if (anyOn || pumpOn != lastPumpState) {
+      Serial.println("--- STATUS UPDATE ---");
+      for (uint8_t z = 0; z < NUM_ZONES; z++) {
+        Serial.print("Zone");
+        Serial.print(z);
+        Serial.print(": ");
+        Serial.print(zoneOn[z] ? "ON " : "OFF");
+        Serial.print(" (manual=");
+        Serial.print(manualShadow[z]);
+        Serial.print(", active=");
+        Serial.print(isActive(z));
+        Serial.print(")");
+        
+        // Show solenoid pin state
+        Serial.print(" pin=");
+        Serial.print(digitalRead(SOLENOID_PINS[z]));
+        Serial.println();
+      }
+      Serial.print("Pump: ");
+      Serial.print(pumpOn ? "ON" : "OFF");
+      Serial.print(" | stopPump=");
+      Serial.print(stopPump);
+      Serial.print(" | anyOn=");
+      Serial.println(anyOn);
+      Serial.println("-------------------");
+    }
+    lastPumpState = pumpOn;
+  }
 }
 
 void updateTime() {
@@ -238,25 +390,51 @@ void updateTime() {
 void setup() {
   Serial.begin(115200);
   delay(250);
-  Serial.println("Irrigation controller starting");
-  initHardware(); initProperties(); initCloudZones();
-  if (eepromOK) { activeSlot = findBestSlot(); loadFromEEPROM(); } else initDefaults(true);
+  Serial.println("\n\n=== Irrigation Controller Starting ===");
+  Serial.println("ESP32-S3 with DS3231 RTC + 24C32 EEPROM + DHT22 + Ultrasonic + VL53L1X ToF");
+  Serial.println("Waiting for serial monitor to connect...");
+  delay(2000);  // Give time for serial monitor to connect
+  
+  initHardware(); 
+  initProperties(); 
+  initCloudZones();
+  
+  if (eepromOK) { 
+    activeSlot = findBestSlot(); 
+    loadFromEEPROM(); 
+  } else {
+    initDefaults(true);
+  }
+  
   ArduinoCloud.begin(ArduinoIoTPreferredConnection);
   updateBattery();
   readDHT22();
-  water_level_safe = true; // Water level sensor removed - always safe
+  
+  Serial.println("=== Setup Complete ===");
+  Serial.println("Ready to receive commands!");
+  Serial.println();
 }
 
 void loop() {
   ArduinoCloud.update();
   bool connected = ArduinoCloud.connected();
-  if (!cloudWasConnected && connected) { lastCloudConnectTime = millis(); loadFromEEPROM(); }
+  if (!cloudWasConnected && connected) { 
+    lastCloudConnectTime = millis(); 
+    loadFromEEPROM(); 
+    Serial.println("Cloud connected!");
+  }
   cloudWasConnected = connected;
+  
   static uint32_t lastTime = 0, lastBatt = 0, lastDHT = 0, lastUltrasonic = 0, lastSoil = 0; 
   uint32_t now = millis();
+  
   if (now - lastTime >= TIME_SYNC_INTERVAL) { updateTime(); lastTime = now; }
   if (now - lastBatt >= BATTERY_READ_INTERVAL) { updateBattery(); lastBatt = now; }
-  if (now - lastUltrasonic >= ULTRASONIC_READ_INTERVAL) { readUltrasonicDistanceCm(); lastUltrasonic = now; }
+  if (now - lastUltrasonic >= ULTRASONIC_READ_INTERVAL) {
+    readUltrasonicDistanceCm();
+    readTOFDistance();
+    lastUltrasonic = now;
+  }
   if (now - lastSoil >= SOIL_READ_INTERVAL) { readSoilMoisture(); lastSoil = now; }
   if (now - lastDHT >= DHT_READ_INTERVAL) {
     readDHT22();
@@ -265,13 +443,16 @@ void loop() {
     printMonitorData();
     lastDHT = now;
   }
+  
   controlZones(); 
   saveToEEPROM(); 
   delay(10);
 }
 
+// Cloud change callbacks
 void onSchedulerStartYearChange() { for (uint8_t z = 0; z < NUM_ZONES; z++) onScheduleChange(z); }
 void onSchedulerStartMonthChange() { for (uint8_t z = 0; z < NUM_ZONES; z++) onScheduleChange(z); }
+
 void onStartAHourSchedChange() { onScheduleChange(0); }
 void onStartAMinuteSchedChange() { onScheduleChange(0); }
 void onSchedulerADurationMinutesChange() { onScheduleChange(0); }
